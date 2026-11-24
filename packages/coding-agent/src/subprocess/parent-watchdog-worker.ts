@@ -8,6 +8,7 @@
 import { parentPort } from "node:worker_threads";
 import type * as Natives from "@oh-my-pi/pi-natives";
 import { consumeWorkerInbox } from "@oh-my-pi/pi-utils/worker-host";
+import type { ParentWatchdogRequest } from "./parent-watchdog";
 
 const POLL_INTERVAL_MS = 250;
 
@@ -20,7 +21,23 @@ function die(): never {
 	throw new Error("parent-watchdog-worker: SIGKILL did not terminate the process");
 }
 
-async function watch(parentPid: number): Promise<void> {
+/** SIGHUP was raised for a gone parent; the kill after the grace is armed. */
+let hangupRaised = false;
+
+/**
+ * The parent is gone: SIGKILL, or with `hangupGraceMs` SIGHUP once (the main
+ * thread's hangup teardown then exits) and SIGKILL after the grace, for a main
+ * thread that is blocked or a teardown or exit that never ends.
+ */
+function parentGone(hangupGraceMs: number | undefined): void {
+	if (hangupGraceMs === undefined) die();
+	if (hangupRaised) return;
+	hangupRaised = true;
+	process.kill(process.pid, "SIGHUP");
+	setTimeout(die, hangupGraceMs);
+}
+
+async function watch({ parentPid, hangupGraceMs }: ParentWatchdogRequest): Promise<void> {
 	// Reparent baseline. omp often runs as PID 1 in containers, so a ppid of 1
 	// alone is not an orphan signal; only a change is. A parent that died before
 	// this snapshot is still caught by the exit probes on `parentPid` below.
@@ -51,15 +68,18 @@ async function watch(parentPid: number): Promise<void> {
 			return err instanceof Error && "code" in err && err.code === "EPERM";
 		}
 	};
-	if (!isParentAlive()) die();
-	if (parent) void parent.waitForExit().then(die, die);
+	const gone = (): void => parentGone(hangupGraceMs);
+	if (!isParentAlive()) gone();
+	if (parent) void parent.waitForExit().then(gone, gone);
 	setInterval(() => {
-		if (!isParentAlive()) die();
+		if (!isParentAlive()) gone();
 	}, POLL_INTERVAL_MS);
 }
 
 const handle = (message: unknown): void => {
-	if (typeof message === "number") void watch(message);
+	if (typeof message === "object" && message !== null && "parentPid" in message) {
+		void watch(message as ParentWatchdogRequest);
+	}
 };
 
 const inbox = consumeWorkerInbox();

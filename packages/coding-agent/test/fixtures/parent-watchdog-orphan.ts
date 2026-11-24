@@ -4,21 +4,35 @@
  * - `child`: arms the watchdog against its parent, reports `armed`, then pins
  *   its main thread in a synchronous loop — the shape of an onnxruntime
  *   `session.run` that starves every main-loop timer (issue #14340).
- * - default (middle): spawns the child, prints its pid, waits for `armed`, then
- *   SIGKILLs itself so the child is orphaned mid-loop.
+ * - `hangup-child <marker>`: arms the watchdog with a hangup grace, records
+ *   each SIGHUP in `marker`, and never exits by itself — the shape of a
+ *   terminal's process whose hangup teardown never ends.
+ * - default (middle; `hangup <marker>` starts a `hangup-child`): spawns the
+ *   child, prints its pid, waits for `armed`, then SIGKILLs itself so the child
+ *   is orphaned.
  */
+import * as fs from "node:fs";
 import { startParentWatchdog } from "../../src/subprocess/parent-watchdog";
 
 const BLOCK_MS = 20_000;
+const HANGUP_GRACE_MS = 1_500;
 
-if (process.argv[2] === "child") {
+const [role, marker] = process.argv.slice(2);
+
+if (role === "child") {
 	startParentWatchdog(process.ppid);
 	process.stdout.write("armed\n");
 	const end = Date.now() + BLOCK_MS;
 	while (Date.now() < end) {}
 	process.stdout.write("survived\n");
+} else if (role === "hangup-child") {
+	startParentWatchdog(process.ppid, { hangupGraceMs: HANGUP_GRACE_MS });
+	process.on("SIGHUP", () => fs.appendFileSync(marker, "hup\n"));
+	process.stdout.write("armed\n");
+	setTimeout(() => {}, BLOCK_MS);
 } else {
-	const child = Bun.spawn([process.execPath, import.meta.path, "child"], {
+	const childArgs = role === "hangup" ? ["hangup-child", marker] : ["child"];
+	const child = Bun.spawn([process.execPath, import.meta.path, ...childArgs], {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "inherit",

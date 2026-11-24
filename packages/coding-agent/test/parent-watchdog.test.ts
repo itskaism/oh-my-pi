@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
 
@@ -24,4 +26,33 @@ describe("startParentWatchdog", () => {
 		if (!exited) child.killTree();
 		expect(exited).toBe(true);
 	}, 15_000);
+
+	// An interactive omp whose terminal went away was left running as a PPID-1
+	// orphan, its endless shell read still growing: the hangup either never
+	// reached it or its teardown never exited. With a hangup grace the watchdog
+	// raises SIGHUP for the process's own teardown, then kills it.
+	it.skipIf(process.platform === "win32")(
+		"raises SIGHUP, then kills an orphan whose hangup teardown never exits",
+		async () => {
+			const marker = path.join(os.tmpdir(), `parent-watchdog-hup-${process.pid}-${Date.now()}`);
+			try {
+				const middle = Bun.spawn([process.execPath, FIXTURE, "hangup", marker], {
+					stdout: "pipe",
+					stderr: "inherit",
+				});
+				const childPid = Number.parseInt((await new Response(middle.stdout).text()).trim(), 10);
+				await middle.exited;
+				expect(middle.signalCode).toBe("SIGKILL");
+
+				const child = Process.fromPid(childPid);
+				const exited = child ? await child.waitForExit({ timeoutMs: 8_000 }) : true;
+				if (!exited) child?.killTree();
+				expect(exited).toBe(true);
+				expect(fs.readFileSync(marker, "utf8")).toBe("hup\n");
+			} finally {
+				fs.rmSync(marker, { force: true });
+			}
+		},
+		15_000,
+	);
 });

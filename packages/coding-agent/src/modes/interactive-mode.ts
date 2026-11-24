@@ -140,6 +140,7 @@ import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
 import { formatCoarseDuration } from "./view-model/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
 import type { SpaceHoldHandler } from "../config/keybindings/space-hold";
+import { startParentWatchdog } from "../subprocess/parent-watchdog";
 import { resolveRestartCmd } from "../subprocess/worker-client";
 
 import { parseConfiguredThinkingLevel } from "../thinking/levels";
@@ -516,6 +517,12 @@ const cfgLiveUiSettings = combine({
 });
 type LiveUiSettings = SettingValueOf<typeof cfgLiveUiSettings>;
 
+/**
+ * How long an orphaned interactive process may run its hangup teardown before
+ * its parent watchdog kills it: the cleanup pass waits 10 s, or up to 120 s
+ * for an isolated task's hold (`task/isolation-runner.ts`).
+ */
+const ORPHAN_HANGUP_GRACE_MS = 150_000;
 const STILL_CLOSING_DELAY_MS = 3_000;
 const JUDGMENT_BATCH_PROGRESS_RETAIN_MS = 1_000;
 /** A transcript action naming an agent to view (a live task card's agent row). */
@@ -2049,6 +2056,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// after the AgentSession constructor's `agent-session:<id>` recorder) runs
 		// FIRST and its dispose() would otherwise persist the generic "dispose".
 		this.#cleanupUnsubscribe = postmortem.register("session-teardown", reason => this.#signalTeardown!(reason));
+		// The terminal going away ends the session. When this process loses its
+		// parent (the shell or terminal host exited and it was reparented), the
+		// watchdog raises SIGHUP for the teardown above and kills it if it still
+		// lives after the cleanup budget. It polls on its own thread, so a blocked
+		// main thread, or an exit held by a wedged native task, cannot leave an
+		// orphan that keeps running.
+		if (process.ppid > 1) startParentWatchdog(process.ppid, { hangupGraceMs: ORPHAN_HANGUP_GRACE_MS });
 
 		// Wire the report_tool_issue consent gate to the Yes/No dialog popup.
 		// The handler is process-global — subagent tools (which can't reach

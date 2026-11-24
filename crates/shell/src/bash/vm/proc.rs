@@ -1258,35 +1258,39 @@ impl Scratch {
 #[derive(Default)]
 pub struct ScratchIo {
 	/// Progress of a `Redir` op or the redirection stage of an `Exec`.
-	pub redir:   RedirProgress,
+	pub redir:          RedirProgress,
 	/// fds saved by the `Exec`'s own redirections.
-	pub saved:   Vec<Saved>,
+	pub saved:          Vec<Saved>,
 	/// Results of file probes and lookups (pollable builtins, `[[ -f ]]`).
-	pub probes:  Vec<(Probe, ProbeResult)>,
+	pub probes:         Vec<(Probe, ProbeResult)>,
 	/// The probe whose fs operation is in flight (`Scratch::live`), with its
 	/// partial progress.
-	pub probing: Option<Probe>,
+	pub probing:        Option<Probe>,
 	/// PATH search of the probe in flight.
-	pub search:  Option<PathSearch>,
+	pub search:         Option<PathSearch>,
 	/// Bytes read so far by an `Input`/`Read` probe.
-	pub input:   Vec<u8>,
+	pub input:          Vec<u8>,
+	/// When the `Input` probe in flight times out (host clock, ns): fixed
+	/// when it starts, checked between reads.
+	pub input_deadline: Option<std::num::NonZeroU64>,
 	/// The pathname-expansion walk of the `Glob` probe in flight.
-	pub walk:    Option<Box<super::glob::Walk>>,
+	pub walk:           Option<Box<super::glob::Walk>>,
 	/// The zsh part ([`ScratchZsh`]), created by zsh code on first use
 	/// ([`Self::zsh()`]): a bash op's progress neither carries nor clears it.
-	pub zsh:     Option<Box<ScratchZsh>>,
+	pub zsh:            Option<Box<ScratchZsh>>,
 }
 
 impl ScratchIo {
 	/// Clear for the next op, keeping the vectors' allocations.
 	fn clear(&mut self) {
-		let Self { redir, saved, probes, probing, search, input, walk, zsh } = self;
+		let Self { redir, saved, probes, probing, search, input, input_deadline, walk, zsh } = self;
 		*redir = RedirProgress::default();
 		saved.clear();
 		probes.clear();
 		*probing = None;
 		*search = None;
 		input.clear();
+		*input_deadline = None;
 		*walk = None;
 		if let Some(z) = zsh {
 			z.clear();
@@ -1414,18 +1418,22 @@ pub enum Probe {
 	/// to EOF, else the read ends with the `lines`-th delimiter (1 but for
 	/// `mapfile`); `nchars` caps the count; `part` numbers successive reads
 	/// of one command (continuation lines, `select` re-prompts); `timeout_ns`
-	/// gives up after that long without complete input (`read -t`, `TMOUT`).
+	/// gives up after that long without complete input (`read -t`, `TMOUT`),
+	/// whether or not the fd ever blocks. `squeeze_nul` keeps a run of NUL
+	/// bytes as one: bash's `read` drops NULs (a `\` before a run still
+	/// takes the first), so an endless NUL source (`/dev/zero`) is not kept.
 	/// Nothing past the end is consumed: a regular file's read-ahead is given
 	/// back, other fds are read a byte at a time. `fd`
 	/// [`Probe::TERMINAL_FD`] reads the shell's terminal
 	/// ([`super::jobctl::open_key_terminal`]).
 	Input {
-		fd:         i32,
-		delim:      Option<u8>,
-		lines:      u32,
-		nchars:     Option<usize>,
-		part:       u32,
-		timeout_ns: Option<u64>,
+		fd:          i32,
+		delim:       Option<u8>,
+		lines:       u32,
+		nchars:      Option<usize>,
+		part:        u32,
+		timeout_ns:  Option<u64>,
+		squeeze_nul: bool,
 	},
 	/// Whether fd has input available, without reading it (`read -t 0`).
 	Ready { fd: i32 },

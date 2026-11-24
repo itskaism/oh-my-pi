@@ -25,6 +25,20 @@ use crate::bash::{
 	ids::Platform,
 };
 
+/// Reads one `perform` of an `Input` or `Read` probe makes before it gives
+/// the turn back. Input that is always ready (`/dev/zero`, a fast producer)
+/// never answers `Pending`, so the op would otherwise keep the engine from
+/// its safepoint, and with it a cancel and every other vproc, for as long
+/// as the input lasts; the read resumes from `ScratchIo::input`.
+const READS_PER_TURN: u32 = 16 * 1024;
+
+/// Give the turn back with `key`: the engine waker fires first, so the op
+/// is runnable again at once (`Shell::runnable`).
+fn yield_turn<T>(tcx: &Context<'_>, key: T) -> T {
+	tcx.waker().wake_by_ref();
+	key
+}
+
 /// The cached answer to `p`.
 pub fn cached<'s>(sc: &'s Scratch, p: &Probe) -> Option<&'s ProbeResult> {
 	sc.probes().iter().find(|(q, _)| q == p).map(|(_, r)| r)
@@ -236,7 +250,12 @@ pub fn perform(
 				// `. /dev/stdin`: the engine's fd, not the host process's.
 				let handle = vp.fds.handle(fd);
 				let input = &mut sc.io().input;
+				let mut reads = 0;
 				loop {
+					if reads == READS_PER_TURN {
+						return Err(yield_turn(&tcx, WaitKey::Read { fd }));
+					}
+					reads += 1;
 					let mut buf = [0u8; 8192];
 					match handle.poll_read(&mut tcx, &mut buf) {
 						Poll::Ready(Ok(0)) => {
@@ -348,7 +367,7 @@ pub fn perform(
 			let handle = input_handle(k, vp, *fd);
 			ProbeResult::Ok(handle.is_open() && handle.poll_read(&mut tcx, &mut []).is_ready())
 		},
-		Probe::Input { fd, delim, lines, nchars, timeout_ns, .. } => {
+		Probe::Input { fd, delim, lines, nchars, timeout_ns, squeeze_nul, .. } => {
 			let handle = input_handle(k, vp, *fd);
 			let seekable = handle.kind() == Some(FileKind::Regular);
 			// A Windows console in line mode ends a line with `\r\n`; a Unix
@@ -357,12 +376,25 @@ pub fn perform(
 			let console_lines = delim == &Some(b'\n')
 				&& handle.kind() == Some(FileKind::Tty)
 				&& k.engine.config().platform == Platform::Windows;
+			let squeeze_nul = *squeeze_nul && *delim != Some(0);
 			// The bytes so far, beside `sc.live` (the timer).
-			let input = &mut sc.io.get_or_insert_with(Box::default).input;
+			let io = sc.io.get_or_insert_with(Box::default);
+			// The deadline is fixed when the read starts and checked before
+			// every read: input that never blocks (`/dev/zero`) never reaches
+			// the timer below, which only wakes a read that waits.
+			if let Some(t) = timeout_ns
+				&& io.input_deadline.is_none()
+			{
+				io.input_deadline =
+					std::num::NonZeroU64::new(cx.host.now_ns().saturating_add(*t).max(1));
+			}
+			let deadline = io.input_deadline;
+			let input = &mut io.input;
 			let lines = (*lines).max(1) as usize;
 			// Delimiters read so far.
 			#[expect(clippy::naive_bytecount, reason = "bytecount is not a omp-shell dependency")]
 			let mut seen = delim.map_or(0, |d| input.iter().filter(|&&c| c == d).count());
+			let mut reads = 0;
 			loop {
 				let done_len = nchars.is_some_and(|n| input.len() >= n);
 				let done_delim = delim.is_some() && seen >= lines;
@@ -373,6 +405,18 @@ pub fn perform(
 						timed_out: false,
 					};
 				}
+				if deadline.is_some_and(|d| cx.host.now_ns() >= d.get()) {
+					// Partial input is kept, as bash's `read -t` does.
+					break ProbeResult::Input {
+						data:      BString::from(std::mem::take(input)),
+						eof:       false,
+						timed_out: true,
+					};
+				}
+				if reads == READS_PER_TURN {
+					return Err(yield_turn(&tcx, WaitKey::Read { fd: *fd }));
+				}
+				reads += 1;
 				// On seekable fds read ahead, then give back what follows
 				// the last delimiter wanted. A line mostly fits the first,
 				// short read: what is read past it is only given back.
@@ -415,12 +459,14 @@ pub fn perform(
 							input.truncate(start + c);
 							let _ = handle.seek(crate::bash::fs::SeekFrom::Current(c as i64 - n as i64));
 						}
+						if squeeze_nul {
+							squeeze_nul_runs(input, start);
+						}
 					},
 					Poll::Pending => {
-						if let Some(t) = timeout_ns {
+						if let Some(d) = deadline {
 							if !matches!(sc.live, Live::Timer(_)) {
-								let at = Deadline(cx.host.now_ns().saturating_add(*t));
-								sc.live = Live::Timer(cx.host.timer(at));
+								sc.live = Live::Timer(cx.host.timer(Deadline(d.get())));
 							}
 							if let Live::Timer(timer) = &mut sc.live
 								&& timer.poll(&mut tcx).is_ready()
@@ -468,6 +514,21 @@ fn line_input(mut data: Vec<u8>, console: bool) -> BString {
 	BString::from(data)
 }
 
+/// Keep each run of NUL bytes in `input[start..]` as one NUL, joining a
+/// run that began before `start`.
+fn squeeze_nul_runs(input: &mut Vec<u8>, start: usize) {
+	let mut w = start;
+	for r in start..input.len() {
+		let c = input[r];
+		if c == 0 && w > 0 && input[w - 1] == 0 {
+			continue;
+		}
+		input[w] = c;
+		w += 1;
+	}
+	input.truncate(w);
+}
+
 /// [`perform`] for a builtin's probe ([`Need::Probe`](super::builtins::Need)):
 /// the fd-level probes ([`Probe::Fd`]) may install descriptors in `vp`'s
 /// fd table ([`super::fdprobe`]); everything else is [`perform`].
@@ -500,6 +561,7 @@ pub(super) fn begin(sc: &mut Scratch, probe: &Probe) {
 		io.search = None;
 		io.walk = None;
 		io.input.clear();
+		io.input_deadline = None;
 		if let Some(z) = io.zsh.as_mut() {
 			z.stats.clear();
 		}
@@ -528,6 +590,7 @@ fn read_file(
 	let err = |e: &std::io::Error| BString::from(diag::strerror(e).as_bytes());
 	// The bytes so far, beside `sc.live` (the file).
 	let input = &mut sc.io.get_or_insert_with(Box::default).input;
+	let mut reads = 0;
 	loop {
 		match &mut sc.live {
 			Live::None => {
@@ -545,6 +608,10 @@ fn read_file(
 				Poll::Pending => return Poll::Pending,
 			},
 			Live::File(f) => {
+				if reads == READS_PER_TURN {
+					return yield_turn(tcx, Poll::Pending);
+				}
+				reads += 1;
 				let mut buf = [0u8; 8192];
 				match f.poll_read(tcx, &mut buf) {
 					Poll::Ready(Ok(0)) => {
