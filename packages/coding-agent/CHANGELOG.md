@@ -53,6 +53,7 @@
 ### Fixed
 - `--no-extensions` no longer imports custom tool modules from `.omp/tools`, `.claude/tools`, `.codex/tools`, or installed plugins; tools from explicitly passed `-e`/`--hook` packages still load
 - Fixed `/fast off` and bare `/fast` claiming "Fast mode disabled." on a model with no service-tier control; they now report that fast mode is unavailable for the current model ([#20284](https://github.com/can1357/oh-my-pi/pull/20284) by [@adammekki](https://github.com/adammekki))
+- Fixed an interactive session whose parent shell and terminal went away without the hangup ending it staying alive as an orphan; once its parent has exited and its terminal is gone it runs its hangup teardown, and it is killed if that teardown has not ended 150 s later. A session whose terminal is still open keeps running after its parent exits
 
 - The `ask` tool returns a prefilled `<textarea>` value unchanged: text such as `<name>` or `<tag attr="x">…</tag>` is no longer dropped from it ([#20299](https://github.com/can1357/oh-my-pi/issues/20299))
 - Fixed context token accounting to reflect changes in system prompt sources
